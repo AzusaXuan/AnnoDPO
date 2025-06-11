@@ -598,7 +598,76 @@ def main(args):
             torch.save(save_obj, finetune_checkpoint)
             model_without_ddp.seq_encoder.save_pretrained(finetune_checkpoint_lora)
         print("finetuning finished")
-    
+
+    if args.mode.startswith("caption"):
+        save_dir = f"{args.captioned_seq_sav_dir}/epoch{args.actual_epoch}"
+        caption_dataset = Dataset_swissprot(mode="train", model=seq_model)
+        caption_sampler = create_sampler(caption_dataset, True, args.world_size, args.rank)
+        caption_dataloader = \
+            create_loader(
+                caption_dataset, 
+                caption_sampler, 
+                batch_size=args.batch_size,
+                num_workers=1,
+                prefetch_factor=4,
+                pin_memory=True,
+                persistent_workers=True,
+                is_training=True,
+                collate_fn=caption_dataset.collate_fn,
+                worker_init_fn=seed_worker,
+                generator=torch.Generator().manual_seed(args.seed)
+            )
+        args.checkpoint = finetune_checkpoint if args.checkpoint is None else args.checkpoint
+
+        if args.mode == "caption_rlhf":
+            
+            # create eval dataloader
+            eval_dataset = Dataset_swissprot(mode="test", model=seq_model)
+            eval_sampler = create_sampler(eval_dataset, True, args.world_size, args.rank)
+            eval_dataloader = create_loader(
+                eval_dataset, 
+                eval_sampler, 
+                batch_size=args.test_batch_size, 
+                num_workers=1, 
+                prefetch_factor=4,
+                pin_memory=True,
+                persistent_workers=True,
+                is_training=False, 
+                collate_fn=eval_dataset.collate_fn,
+                worker_init_fn=seed_worker,
+                generator=torch.Generator().manual_seed(args.seed)
+            )
+            
+            # get model dict and unpack
+            # models = create_dpo_model(args, seq_model, finetune_checkpoint)
+            models = create_dpo_model_seq_lora(args, seq_model, finetune_checkpoint, load_finetune_checkpoint_lora, load_rlhf_checkpoint, args.actual_epoch)
+            if args.rank == 0 and args.use_wandb:  # only in main process
+                wandb.watch(models['actor'], log="parameters", log_freq=100)
+            actor_model = models['actor']
+            reference_model = models['reference'] 
+            optimizer_actor = models['optimizer']
+            # pass unpacked model and eval dataloader
+            clean_with_dpo(
+                train_loader=caption_dataloader,
+                test_dataloader=eval_dataloader,
+                args=args,
+                actor_model=actor_model,
+                reference_model=reference_model,
+                optimizer_actor=optimizer_actor
+            )
+
+            if args.rank == 0:
+                print(f'Saving checkpoint for epoch {args.actual_epoch}')
+                save_obj = {
+                    'actor': actor_model.module.state_dict(),
+                    'optimizer_finetune': optimizer_actor.state_dict(),
+                    'epoch': args.actual_epoch,
+                }
+                actor_model.module.seq_encoder.save_pretrained(finetune_checkpoint_lora)
+                torch.save(save_obj, rlhf_checkpoint)
+
+            print("rlhf training finished")
+
 
     if args.mode.startswith("eval"):
         if args.mode.startswith("eval_freq_"): # eval_freq_high, eval_freq_medium, eval_freq_low
